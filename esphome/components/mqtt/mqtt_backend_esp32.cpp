@@ -118,9 +118,10 @@ void MQTTBackendESP32::loop() {
 
   // A DISCONNECTED event was dropped (pool full). Wait for the queue to drain so no older
   // CONNECTED event can follow it, then handle it as if it had arrived.
-  // link_up_ is read before empty(): it is cleared after the push, so if a queued DISCONNECTED
-  // exists, seeing link_up_ == 0 guarantees empty() sees it too.
-  if (this->is_connected_ && !this->link_up_.load() && this->mqtt_event_queue_.empty()) {
+  // task_link_state_ is read before empty(): it is cleared after the push, so if a queued
+  // DISCONNECTED exists, seeing DISCONNECTED here guarantees empty() sees it too.
+  if (this->is_connected_ && this->task_link_state_.load() == LinkState::DISCONNECTED &&
+      this->mqtt_event_queue_.empty()) {
     ESP_LOGW(TAG, "Disconnect event was dropped, handling it now");
     this->handle_disconnected_();
   }
@@ -161,6 +162,12 @@ void MQTTBackendESP32::mqtt_event_handler_(const Event &event) {
 
     case MQTT_EVENT_CONNECTED:
       ESP_LOGV(TAG, "MQTT_EVENT_CONNECTED");
+      if (this->requested_link_state_.load() == LinkState::DISCONNECTED) {
+        // Connect was already in progress when disconnect() ran; the MQTT task closes it
+        // right away, so don't report it as connected
+        ESP_LOGV(TAG, "Ignoring CONNECTED, disconnect pending");
+        break;
+      }
       this->is_connected_ = true;
 #if defined(USE_MQTT_IDF_ENQUEUE)
       this->last_dropped_log_time_ = 0;
@@ -251,12 +258,13 @@ void MQTTBackendESP32::mqtt_event_handler(void *handler_args, esp_event_base_t b
   }
 #endif
   // The SDK clears a pending disconnect request just before this event, so ask again if one is still wanted
-  if (event_id == MQTT_EVENT_BEFORE_CONNECT && !instance->want_connected_.load()) {
+  if (event_id == MQTT_EVENT_BEFORE_CONNECT &&
+      instance->requested_link_state_.load() == LinkState::DISCONNECTED) {
     const auto *mqtt_event = static_cast<esp_mqtt_event_t *>(event_data);
     esp_mqtt_client_disconnect(mqtt_event->client);
   }
   if (event_id == MQTT_EVENT_CONNECTED) {
-    instance->link_up_.store(1);
+    instance->task_link_state_.store(LinkState::CONNECTED);
   }
   // queue event to decouple processing from ESP-IDF MQTT task to main loop
   auto *event = instance->mqtt_event_pool_.allocate();
@@ -265,7 +273,7 @@ void MQTTBackendESP32::mqtt_event_handler(void *handler_args, esp_event_base_t b
     instance->mqtt_event_queue_.increment_dropped_count();
     if (event_id == MQTT_EVENT_DISCONNECTED) {
       // Without auto-reconnect a lost disconnect would leave us offline; loop() handles it
-      instance->link_up_.store(0);
+      instance->task_link_state_.store(LinkState::DISCONNECTED);
     }
     return;
   }
@@ -274,7 +282,7 @@ void MQTTBackendESP32::mqtt_event_handler(void *handler_args, esp_event_base_t b
   // allocate() returned non-null, the queue cannot be full.
   instance->mqtt_event_queue_.push(event);
   if (event_id == MQTT_EVENT_DISCONNECTED) {
-    instance->link_up_.store(0);  // after the push, see link_up_
+    instance->task_link_state_.store(LinkState::DISCONNECTED);  // after the push, see task_link_state_
   }
 
   // Wake main loop immediately to process MQTT event
